@@ -1,5 +1,7 @@
 # pc-cleanuptool
 A PowerShell GUI tool for cleaning, optimizing, and configuring Windows with one click. Includes system cleanup, network tools, Windows tweaks, and more.
+# This tool is provided as-is. I am not liable for any system issues or damages resulting from its use.
+
 
 
 - System Cleanup
