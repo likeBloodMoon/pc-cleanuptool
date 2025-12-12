@@ -10,6 +10,11 @@ Includes system cleanup, network tools, Windows tweaks, and more.
 
 ## Getting Started
 
+1.Run this command in **Powershell as Administrator**
+```Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile -STA -ExecutionPolicy Bypass -Command `$s=irm https://raw.githubusercontent.com/likeBloodMoon/pc-cleanuptool/main/pc-cleanuptool.ps1; iex `$s"```
+
+# OR
+
 1. Download or clone the repository  
 2. Open **PowerShell as Administrator**  
 3. Run the script: .\pc-cleanup.ps1
