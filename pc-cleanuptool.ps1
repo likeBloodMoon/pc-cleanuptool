@@ -48,10 +48,20 @@ if (-not (Test-Admin)) {
     ) | Out-Null
     exit 1
 }
+# --- Script root (works both from file and from iwr|iex / in-memory) ---
+$scriptPath = $PSCommandPath
+if ([string]::IsNullOrWhiteSpace($scriptPath)) { $scriptPath = $MyInvocation.MyCommand.Path }
 
-$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$logDir     = Join-Path $scriptRoot "logs"
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+# If executed from memory, fall back to a writable folder
+if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+    $scriptRoot = Join-Path $env:LOCALAPPDATA "PC-CleanupTool"
+} else {
+    $scriptRoot = Split-Path -Parent $scriptPath
+}
+
+# --- Logs folder ---
+$logDir = Join-Path $scriptRoot "logs"
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
 $logFile = Join-Path $logDir ("pc-cleanup-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmm"))
 $script:LogTextBox = $null
