@@ -1,0 +1,22 @@
+# Runtime output
+logs/
+reports/
+*.log
+
+# Build / release output
+out/
+dist/
+*.zip
+SHA256SUMS
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# PowerShell
+*.psproj
+testResults*.xml
