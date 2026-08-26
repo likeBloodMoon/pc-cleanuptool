@@ -344,7 +344,7 @@ $btnClose.Add_Click({ $form.Close() })
 $titleBar.Controls.Add($btnClose)
 
 $btnMin = New-Object System.Windows.Forms.Button
-$btnMin.Text = "–"
+$btnMin.Text = "-"
 $btnMin.Width = 46
 $btnMin.FlatStyle = "Flat"
 $btnMin.FlatAppearance.BorderSize = 0

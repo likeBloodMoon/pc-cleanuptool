@@ -1,7 +1,7 @@
 
 <#
   PC Cleanup & Optimization Tool - GUI Edition (Styled, Fixed Layout)
-  Author: Kristóf
+  Author: Kristof
 
   Features:
     - Clean temp files
@@ -41,7 +41,7 @@ function Test-Admin {
 if (-not (Test-Admin)) {
     Add-Type -AssemblyName System.Windows.Forms
     [System.Windows.Forms.MessageBox]::Show(
-        "Please run this script as Administrator.`r`nRight-click PowerShell → Run as administrator.",
+        "Please run this script as Administrator.`r`nRight-click PowerShell -> Run as administrator.",
         "PC Cleanup Tool",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error
