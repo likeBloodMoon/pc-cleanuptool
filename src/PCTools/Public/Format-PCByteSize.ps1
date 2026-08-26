@@ -3,6 +3,12 @@ function Format-PCByteSize {
     .SYNOPSIS
         Formats a byte count for display.
 
+    .DESCRIPTION
+        Public because hosts need it. Each ActionResult carries its own
+        FreedDisplay, but a caller totalling several of them - the GUI's summary
+        line, for one - needs to format the sum, and reaching into the module's
+        private scope to do that is not an interface.
+
     .EXAMPLE
         Format-PCByteSize -Bytes 4509715660
         4.2 GB

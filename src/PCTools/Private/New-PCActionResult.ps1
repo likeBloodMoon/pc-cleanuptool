@@ -53,22 +53,22 @@ function New-PCActionResult {
         [hashtable]$Data
     )
 
-    $result = [pscustomobject]@{
+    # FreedDisplay is computed here rather than added as a ScriptProperty.
+    # A ScriptProperty's scriptblock stays bound to the session state it was
+    # created in, and these objects are returned across a runspace boundary to
+    # the GUI - so a lazily evaluated property would be reaching into a
+    # runspace that has since gone back to the pool.
+    [pscustomobject]@{
         PSTypeName     = 'PCTools.ActionResult'
         Action         = $Action
         Status         = $Status
         Detail         = $Detail
         BytesFreed     = $BytesFreed
+        FreedDisplay   = Format-PCByteSize -Bytes $BytesFreed
         Duration       = $Duration
         RebootRequired = [bool]$RebootRequired
         Timestamp      = Get-Date
         ErrorRecord    = $ErrorRecord
         Data           = $Data
     }
-
-    Add-Member -InputObject $result -MemberType ScriptProperty -Name FreedDisplay -Value {
-        Format-PCByteSize -Bytes $this.BytesFreed
-    }
-
-    $result
 }

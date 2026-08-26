@@ -48,6 +48,7 @@
         'Invoke-PCMaintenance'
 
         # Host integration
+        'Format-PCByteSize'
         'Get-PCLogPath'
         'Register-PCLogSink'
         'Test-PCAdmin'

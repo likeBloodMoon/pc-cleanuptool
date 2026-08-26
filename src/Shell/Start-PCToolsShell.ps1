@@ -1,0 +1,1559 @@
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    PC Tools - the unified GUI shell for pc-powershelltools.
+
+.DESCRIPTION
+    Promotes gui-framework.ps1 from a demo into the application shell, and
+    replaces the two bespoke WinForms UIs in pc-cleanuptool.ps1 and
+    pc-netdiag.ps1.
+
+    The shell owns presentation only. Every action it runs comes from the
+    PCTools module, on a background runspace, so the window stays responsive
+    during a DISM run that the original tools would have frozen for half an
+    hour.
+
+.PARAMETER Theme
+    Dark or Light. Defaults to Dark.
+
+.EXAMPLE
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-PCToolsShell.ps1
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('Dark', 'Light')]
+    [string]$Theme = 'Dark'
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+#region Bootstrap
+
+# WinForms needs a single-threaded apartment. Windows PowerShell 5.1 gives us
+# one by default; pwsh.exe does not, and the failure mode without this check is
+# a window that opens and immediately deadlocks.
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    Write-Warning 'This shell requires an STA host. Relaunching under Windows PowerShell...'
+    $relaunch = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA',
+        '-File', "`"$PSCommandPath`"", '-Theme', $Theme
+    )
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $relaunch
+    return
+}
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Per-monitor DPI awareness. Without it the fixed-pixel layouts in the original
+# tools render blurry and clip their text at 150% scaling, which is the default
+# on most laptops sold in the last five years.
+if (-not ('PCTools.Native' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace PCTools {
+    public static class Native {
+        public const int WM_NCLBUTTONDOWN = 0xA1;
+        public const int HTCAPTION = 0x2;
+
+        [DllImport("user32.dll")]
+        public static extern bool ReleaseCapture();
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, int wParam, int lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetProcessDPIAware();
+
+        [DllImport("shcore.dll")]
+        public static extern int SetProcessDpiAwareness(int value);
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+    }
+}
+'@
+}
+
+try {
+    # PROCESS_PER_MONITOR_DPI_AWARE = 2. Falls back on Windows 7/8.
+    [void][PCTools.Native]::SetProcessDpiAwareness(2)
+}
+catch {
+    try { [void][PCTools.Native]::SetProcessDPIAware() } catch { }
+}
+
+[System.Windows.Forms.Application]::EnableVisualStyles()
+[System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+
+# Surface UI-thread exceptions instead of closing the window silently, which is
+# what the original Cleanup Tool did on any unhandled error.
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode(
+    [System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+
+#endregion
+
+#region Module import
+
+$script:ShellRoot = $PSScriptRoot
+$modulePath = Join-Path (Split-Path -Parent $script:ShellRoot) 'PCTools\PCTools.psd1'
+
+if (Test-Path -LiteralPath $modulePath) {
+    Import-Module $modulePath -Force -ErrorAction Stop
+}
+elseif (Get-Module -ListAvailable -Name PCTools) {
+    Import-Module PCTools -Force -ErrorAction Stop
+    $modulePath = (Get-Module PCTools).Path
+}
+else {
+    [System.Windows.Forms.MessageBox]::Show(
+        "The PCTools module could not be found.`r`n`r`nExpected at:`r`n$modulePath",
+        'PC Tools', 'OK', 'Error') | Out-Null
+    return
+}
+
+$script:ModulePath = $modulePath
+
+#endregion
+
+#region Application state
+
+$script:App = [ordered]@{
+    Name    = 'PC Tools'
+    Version = (Get-Module PCTools).Version.ToString()
+    Window  = @{ Width = 1120; Height = 760; MinWidth = 940; MinHeight = 620 }
+    Async   = @{ MaxRunspaces = 3 }
+}
+
+# Everything the UI thread and the runspaces both touch lives here.
+# Every control key is declared up front and set later during construction.
+# Under Set-StrictMode -Version Latest, reading a key that does not yet exist
+# is a terminating error - so a guard like `if ($sync.Controls.StatusLabel)`
+# would throw instead of returning false. Declaring them removes that whole
+# class of failure.
+$controls = @{
+    SubtitleLabel   = $null
+    ElevateButton   = $null
+    ContentHost     = $null
+    StatusLabel     = $null
+    SummaryLabel    = $null
+    Progress        = $null
+    RunButtons      = $null
+    MaintenanceGrid = $null
+    AdapterGrid     = $null
+    VerdictLabel    = $null
+    AdviceLabel     = $null
+    NetworkGrid     = $null
+    PreferenceGrid  = $null
+    LogGrid         = $null
+}
+
+$sync = [hashtable]::Synchronized(@{
+    Form     = $null
+    Controls = $controls
+    Theme    = $Theme
+    LogQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    Tasks    = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+    Busy     = $false
+})
+
+$script:Sync = $sync
+
+#endregion
+
+#region Theme
+
+$script:Themes = @{
+    Dark = @{
+        Back       = [System.Drawing.Color]::FromArgb(18, 18, 20)
+        Panel      = [System.Drawing.Color]::FromArgb(24, 24, 28)
+        Card       = [System.Drawing.Color]::FromArgb(30, 30, 36)
+        Text       = [System.Drawing.Color]::FromArgb(230, 230, 235)
+        Muted      = [System.Drawing.Color]::FromArgb(158, 158, 170)
+        Border     = [System.Drawing.Color]::FromArgb(52, 52, 62)
+        Button     = [System.Drawing.Color]::FromArgb(38, 38, 46)
+        Accent     = [System.Drawing.Color]::FromArgb(64, 132, 214)
+        AccentText = [System.Drawing.Color]::White
+        Success    = [System.Drawing.Color]::FromArgb(88, 190, 120)
+        Warning    = [System.Drawing.Color]::FromArgb(226, 178, 78)
+        Danger     = [System.Drawing.Color]::FromArgb(224, 108, 108)
+    }
+    Light = @{
+        Back       = [System.Drawing.Color]::FromArgb(244, 245, 248)
+        Panel      = [System.Drawing.Color]::FromArgb(255, 255, 255)
+        Card       = [System.Drawing.Color]::FromArgb(255, 255, 255)
+        Text       = [System.Drawing.Color]::FromArgb(28, 28, 34)
+        Muted      = [System.Drawing.Color]::FromArgb(96, 96, 108)
+        Border     = [System.Drawing.Color]::FromArgb(212, 214, 222)
+        Button     = [System.Drawing.Color]::FromArgb(238, 239, 243)
+        Accent     = [System.Drawing.Color]::FromArgb(28, 106, 200)
+        AccentText = [System.Drawing.Color]::White
+        Success    = [System.Drawing.Color]::FromArgb(28, 138, 68)
+        Warning    = [System.Drawing.Color]::FromArgb(168, 118, 16)
+        Danger     = [System.Drawing.Color]::FromArgb(190, 58, 58)
+    }
+}
+
+function Get-ThemeColor {
+    param([Parameter(Mandatory)][string]$Name)
+    $script:Themes[$script:Sync.Theme][$Name]
+}
+
+#endregion
+
+#region Fonts
+
+function New-ShellFont {
+    param(
+        [double]$Size = 9.5,
+        [System.Drawing.FontStyle]$Style = [System.Drawing.FontStyle]::Regular
+    )
+
+    $family = 'Segoe UI'
+    try {
+        $available = [System.Drawing.FontFamily]::Families | ForEach-Object Name
+        if ($available -notcontains $family) { $family = 'Microsoft Sans Serif' }
+    }
+    catch { $family = 'Microsoft Sans Serif' }
+
+    New-Object System.Drawing.Font($family, [single]$Size, $Style)
+}
+
+$script:FontBody   = New-ShellFont 9.5
+$script:FontBold   = New-ShellFont 9.5 ([System.Drawing.FontStyle]::Bold)
+$script:FontHeader = New-ShellFont 13 ([System.Drawing.FontStyle]::Bold)
+$script:FontTitle  = New-ShellFont 11 ([System.Drawing.FontStyle]::Bold)
+$script:FontMono   = New-Object System.Drawing.Font('Consolas', 9)
+
+#endregion
+
+#region UI marshalling
+
+function Invoke-UI {
+    <#
+        Runs a scriptblock on the UI thread.
+
+        Arguments are passed explicitly rather than captured from the calling
+        scope. That distinction is not cosmetic: when the block is queued with
+        BeginInvoke it executes after the calling function has returned, and a
+        captured local is no longer resolvable by then - the block fails with
+        "the expression after '&' produced an object that was not valid" rather
+        than doing anything useful. The original framework got away with it only
+        because its callers happened to already be on the UI thread, where
+        InvokeRequired is false and the block runs synchronously.
+    #>
+    param(
+        [Parameter(Mandatory)][scriptblock]$Script,
+        [object[]]$Arguments = @()
+    )
+
+    $form = $script:Sync.Form
+    if (-not $form -or $form.IsDisposed) { return }
+
+    # Bind the arguments into a closure now, while the caller's values are
+    # still live. GetNewClosure() copies them into a fresh scope that lives as
+    # long as the scriptblock, so the block is self-contained by the time the
+    # UI thread runs it - and this does not depend on how WinForms marshals a
+    # delegate's parameter array.
+    $bound = if ($Arguments.Count -gt 0) {
+        $boundScript = $Script
+        $boundArguments = $Arguments
+        { & $boundScript @boundArguments }.GetNewClosure()
+    }
+    else {
+        $Script
+    }
+
+    if ($form.InvokeRequired) {
+        try { $null = $form.BeginInvoke($bound) } catch { }
+    }
+    else {
+        & $bound
+    }
+}
+
+function Write-ShellLog {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')][string]$Level = 'INFO'
+    )
+
+    $script:Sync.LogQueue.Enqueue([pscustomobject]@{
+        Timestamp = Get-Date -Format 'HH:mm:ss'
+        Level     = $Level
+        Message   = $Message
+    })
+}
+
+#endregion
+
+#region Async runspace pool
+
+$script:Pool = [runspacefactory]::CreateRunspacePool(1, $script:App.Async.MaxRunspaces)
+$script:Pool.ApartmentState = 'STA'
+$script:Pool.ThreadOptions = 'ReuseThread'
+$script:Pool.Open()
+
+function Start-ShellTask {
+    <#
+        Runs work on a background runspace and calls back on the UI thread.
+
+        The runspace imports PCTools itself - a runspace does not inherit the
+        caller's modules - and registers a log sink that pushes the module's own
+        log lines onto the shared queue, so the log pane shows progress from
+        inside a long DISM run instead of nothing until it finishes.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Script,
+        [hashtable]$Arguments = @{},
+        [scriptblock]$OnSuccess,
+        [scriptblock]$OnError,
+        [scriptblock]$OnFinally
+    )
+
+    if ($script:Sync.Busy) {
+        Write-ShellLog -Level WARN -Message "Busy: '$Name' was not started."
+        return
+    }
+
+    $script:Sync.Busy = $true
+    Set-ShellStatus -Text $Name -Busy $true
+    Write-ShellLog -Level INFO -Message "Started: $Name"
+
+    $wrapper = {
+        param($ModulePath, $Body, $BodyArguments, $SharedState)
+
+        Import-Module $ModulePath -Force -ErrorAction Stop
+
+        # Bridge module logging into the shell's log pane.
+        $sinkId = Register-PCLogSink {
+            param($entry)
+            $SharedState.LogQueue.Enqueue([pscustomobject]@{
+                Timestamp = ($entry.Timestamp -split ' ')[-1]
+                Level     = $entry.Level
+                Message   = $entry.Message
+            })
+        }.GetNewClosure()
+
+        try {
+            & $Body @BodyArguments
+        }
+        finally {
+            Unregister-PCLogSink -Id $sinkId
+        }
+    }
+
+    $shell = [powershell]::Create()
+    $shell.RunspacePool = $script:Pool
+    $null = $shell.AddScript($wrapper).
+        AddArgument($script:ModulePath).
+        AddArgument($Script).
+        AddArgument($Arguments).
+        AddArgument($script:Sync)
+
+    $handle = $shell.BeginInvoke()
+
+    [void]$script:Sync.Tasks.Add([pscustomobject]@{
+        Name      = $Name
+        Shell     = $shell
+        Handle    = $handle
+        OnSuccess = $OnSuccess
+        OnError   = $OnError
+        OnFinally = $OnFinally
+    })
+}
+
+function Complete-ShellTask {
+    param([Parameter(Mandatory)]$Task)
+
+    try {
+        $result = $Task.Shell.EndInvoke($Task.Handle)
+
+        $errors = @($Task.Shell.Streams.Error)
+        foreach ($record in $errors) {
+            Write-ShellLog -Level WARN -Message $record.Exception.Message
+        }
+
+        Write-ShellLog -Level INFO -Message "Finished: $($Task.Name)"
+
+        if ($Task.OnSuccess) {
+            Invoke-UI -Script { param($Callback, $Value) & $Callback $Value } `
+                      -Arguments @($Task.OnSuccess, $result)
+        }
+    }
+    catch {
+        $message = "$($Task.Name) failed: $($_.Exception.Message)"
+        Write-ShellLog -Level ERROR -Message $message
+
+        if ($Task.OnError) {
+            Invoke-UI -Script { param($Callback, $Value) & $Callback $Value } `
+                      -Arguments @($Task.OnError, $_)
+        }
+    }
+    finally {
+        try { $Task.Shell.Dispose() } catch { }
+
+        if ($Task.OnFinally) {
+            Invoke-UI -Script { param($Callback) & $Callback } -Arguments @($Task.OnFinally)
+        }
+
+        $script:Sync.Busy = $false
+        Set-ShellStatus -Text 'Ready' -Busy $false
+    }
+}
+
+#endregion
+
+#region UI factory
+
+function New-Card {
+    param([string]$Title, [int]$Padding = 16)
+
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Dock = 'Fill'
+    $card.Padding = New-Object System.Windows.Forms.Padding($Padding)
+    $card.BackColor = Get-ThemeColor Card
+    $card.Tag = 'Card'
+
+    if ($Title) {
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $Title
+        $label.Dock = 'Top'
+        $label.Height = 30
+        $label.Font = $script:FontTitle
+        $label.ForeColor = Get-ThemeColor Text
+        $label.Tag = 'Heading'
+        $card.Controls.Add($label)
+    }
+
+    $card
+}
+
+function New-Button {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [int]$Width = 170,
+        [int]$Height = 34,
+        [switch]$Accent,
+        [scriptblock]$OnClick
+    )
+
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = $Text
+    $button.Width = $Width
+    $button.Height = $Height
+    $button.Font = $script:FontBody
+    $button.FlatStyle = 'Flat'
+    $button.FlatAppearance.BorderSize = 1
+    $button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 8)
+    $button.Cursor = 'Hand'
+    $button.Tag = if ($Accent) { 'AccentButton' } else { 'Button' }
+
+    if ($OnClick) { $button.Add_Click($OnClick) }
+
+    $button
+}
+
+function New-CheckBox {
+    param([Parameter(Mandatory)][string]$Text, [string]$Name, [bool]$Checked = $false)
+
+    $box = New-Object System.Windows.Forms.CheckBox
+    $box.Text = $Text
+    $box.AutoSize = $true
+    $box.Checked = $Checked
+    $box.Font = $script:FontBody
+    $box.ForeColor = Get-ThemeColor Text
+    $box.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 4)
+    $box.Tag = $Name
+    $box
+}
+
+function New-ResultGrid {
+    $grid = New-Object System.Windows.Forms.ListView
+    $grid.Dock = 'Fill'
+    $grid.View = 'Details'
+    $grid.FullRowSelect = $true
+    $grid.GridLines = $false
+    $grid.HideSelection = $false
+    $grid.Font = $script:FontBody
+    $grid.BorderStyle = 'None'
+    $grid.OwnerDraw = $false
+    [void]$grid.Columns.Add('Status', 90)
+    [void]$grid.Columns.Add('Action', 200)
+    [void]$grid.Columns.Add('Freed', 90)
+    [void]$grid.Columns.Add('Detail', 640)
+    $grid
+}
+
+function Add-ResultRow {
+    <#
+        Renders one PCTools.ActionResult into a grid. The colour comes from the
+        status, so a failure is visible without reading every row - the original
+        log box printed everything in the same grey.
+    #>
+    param(
+        [Parameter(Mandatory)]$Grid,
+        [Parameter(Mandatory)]$Result
+    )
+
+    $item = New-Object System.Windows.Forms.ListViewItem($Result.Status)
+    [void]$item.SubItems.Add([string]$Result.Action)
+    [void]$item.SubItems.Add($(if ($Result.BytesFreed -gt 0) { $Result.FreedDisplay } else { '' }))
+    [void]$item.SubItems.Add([string]$Result.Detail)
+
+    $item.ForeColor = switch ($Result.Status) {
+        'Success' { Get-ThemeColor Success }
+        'Warning' { Get-ThemeColor Warning }
+        'Failed'  { Get-ThemeColor Danger }
+        default   { Get-ThemeColor Muted }
+    }
+
+    [void]$Grid.Items.Add($item)
+    $Grid.EnsureVisible($Grid.Items.Count - 1)
+}
+
+function Show-Summary {
+    <#
+        The results summary the roadmap asked for: one line the user can read
+        instead of interpreting a log.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Result)
+
+    $label = $script:Sync.Controls.SummaryLabel
+    if (-not $label) { return }
+
+    if ($Result.Count -eq 0) {
+        $label.Text = ''
+        return
+    }
+
+    $succeeded = @($Result | Where-Object Status -eq 'Success').Count
+    $failed = @($Result | Where-Object Status -eq 'Failed').Count
+    $warned = @($Result | Where-Object Status -eq 'Warning').Count
+    $freed = ($Result | Measure-Object -Property BytesFreed -Sum).Sum
+    $reboot = @($Result | Where-Object RebootRequired).Count -gt 0
+
+    $parts = @("$($Result.Count) action(s)", "$succeeded ok")
+    if ($warned) { $parts += "$warned warning" }
+    if ($failed) { $parts += "$failed failed" }
+    if ($freed -gt 0) { $parts += "$(Format-PCByteSize -Bytes $freed) reclaimed" }
+    if ($reboot) { $parts += 'restart required' }
+
+    $label.Text = $parts -join '  -  '
+    $label.ForeColor = if ($failed) { Get-ThemeColor Danger }
+                       elseif ($warned -or $reboot) { Get-ThemeColor Warning }
+                       else { Get-ThemeColor Success }
+}
+
+function Set-ShellStatus {
+    param([string]$Text = 'Ready', [bool]$Busy = $false)
+
+    Invoke-UI -Script {
+        param($StatusText, $IsBusy)
+        $controls = $script:Sync.Controls
+        if ($controls.StatusLabel) { $controls.StatusLabel.Text = $StatusText }
+        if ($controls.Progress) { $controls.Progress.Visible = $IsBusy }
+        foreach ($button in @($controls.RunButtons)) {
+            if ($button -and -not $button.IsDisposed) { $button.Enabled = -not $IsBusy }
+        }
+    } -Arguments @($Text, $Busy)
+}
+
+#endregion
+
+#region Window chrome
+
+$form = New-Object System.Windows.Forms.Form
+$script:Sync.Form = $form
+$form.Text = "$($script:App.Name) $($script:App.Version)"
+$form.FormBorderStyle = 'Sizable'
+$form.StartPosition = 'CenterScreen'
+$form.ClientSize = New-Object System.Drawing.Size($script:App.Window.Width, $script:App.Window.Height)
+$form.MinimumSize = New-Object System.Drawing.Size($script:App.Window.MinWidth, $script:App.Window.MinHeight)
+$form.BackColor = Get-ThemeColor Back
+$form.Font = $script:FontBody
+
+$form.SuspendLayout()
+
+# Root: a 2x2 grid - header spans the top, nav on the left, content on the
+# right, status bar across the bottom. Everything docks, so the window resizes
+# properly. The original Cleanup Tool used absolute Point/Size coordinates and
+# had to disable its own maximize button as a result.
+$root = New-Object System.Windows.Forms.TableLayoutPanel
+$root.Dock = 'Fill'
+$root.ColumnCount = 2
+$root.RowCount = 3
+$root.Padding = New-Object System.Windows.Forms.Padding(12)
+$root.BackColor = Get-ThemeColor Back
+[void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 210)))
+[void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 56)))
+[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 40)))
+$form.Controls.Add($root)
+
+# Header
+$header = New-Object System.Windows.Forms.Panel
+$header.Dock = 'Fill'
+$header.BackColor = Get-ThemeColor Back
+$root.Controls.Add($header, 0, 0)
+$root.SetColumnSpan($header, 2)
+
+$titleLabel = New-Object System.Windows.Forms.Label
+$titleLabel.Text = $script:App.Name
+$titleLabel.Font = $script:FontHeader
+$titleLabel.ForeColor = Get-ThemeColor Text
+$titleLabel.AutoSize = $true
+$titleLabel.Location = New-Object System.Drawing.Point(2, 2)
+$header.Controls.Add($titleLabel)
+
+$subtitleLabel = New-Object System.Windows.Forms.Label
+$subtitleLabel.Font = $script:FontBody
+$subtitleLabel.ForeColor = Get-ThemeColor Muted
+$subtitleLabel.AutoSize = $true
+$subtitleLabel.Location = New-Object System.Drawing.Point(3, 28)
+$header.Controls.Add($subtitleLabel)
+$script:Sync.Controls.SubtitleLabel = $subtitleLabel
+
+$headerButtons = New-Object System.Windows.Forms.FlowLayoutPanel
+$headerButtons.Dock = 'Right'
+$headerButtons.FlowDirection = 'RightToLeft'
+$headerButtons.WrapContents = $false
+$headerButtons.AutoSize = $true
+$header.Controls.Add($headerButtons)
+
+$themeButton = New-Button -Text 'Theme' -Width 80 -Height 28
+$headerButtons.Controls.Add($themeButton)
+
+$elevateButton = New-Button -Text 'Restart as admin' -Width 140 -Height 28
+$headerButtons.Controls.Add($elevateButton)
+$script:Sync.Controls.ElevateButton = $elevateButton
+
+# Left navigation
+$nav = New-Object System.Windows.Forms.FlowLayoutPanel
+$nav.Dock = 'Fill'
+$nav.FlowDirection = 'TopDown'
+$nav.WrapContents = $false
+$nav.Padding = New-Object System.Windows.Forms.Padding(0, 4, 12, 0)
+$nav.BackColor = Get-ThemeColor Back
+$root.Controls.Add($nav, 0, 1)
+
+# Content host - one panel per page, only one visible at a time
+$contentHost = New-Object System.Windows.Forms.Panel
+$contentHost.Dock = 'Fill'
+$contentHost.BackColor = Get-ThemeColor Back
+$root.Controls.Add($contentHost, 1, 1)
+$script:Sync.Controls.ContentHost = $contentHost
+
+# Status bar
+$statusBar = New-Object System.Windows.Forms.TableLayoutPanel
+$statusBar.Dock = 'Fill'
+$statusBar.ColumnCount = 3
+$statusBar.BackColor = Get-ThemeColor Panel
+$statusBar.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 8)
+[void]$statusBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 260)))
+[void]$statusBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$statusBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 170)))
+$root.Controls.Add($statusBar, 0, 2)
+$root.SetColumnSpan($statusBar, 2)
+
+$statusLabel = New-Object System.Windows.Forms.Label
+$statusLabel.Text = 'Ready'
+$statusLabel.AutoSize = $false
+$statusLabel.Dock = 'Fill'
+$statusLabel.TextAlign = 'MiddleLeft'
+$statusLabel.ForeColor = Get-ThemeColor Muted
+$statusBar.Controls.Add($statusLabel, 0, 0)
+$script:Sync.Controls.StatusLabel = $statusLabel
+
+$summaryLabel = New-Object System.Windows.Forms.Label
+$summaryLabel.AutoSize = $false
+$summaryLabel.Dock = 'Fill'
+$summaryLabel.TextAlign = 'MiddleLeft'
+$summaryLabel.Font = $script:FontBold
+$summaryLabel.ForeColor = Get-ThemeColor Muted
+$statusBar.Controls.Add($summaryLabel, 1, 0)
+$script:Sync.Controls.SummaryLabel = $summaryLabel
+
+$progress = New-Object System.Windows.Forms.ProgressBar
+$progress.Dock = 'Fill'
+$progress.Style = 'Marquee'
+$progress.MarqueeAnimationSpeed = 28
+$progress.Visible = $false
+$statusBar.Controls.Add($progress, 2, 0)
+$script:Sync.Controls.Progress = $progress
+
+#endregion
+
+#region Page infrastructure
+
+$script:LastResults = @()
+$script:LastReport = $null
+$script:Pages = [ordered]@{}
+$script:NavButtons = @{}
+$script:Sync.Controls.RunButtons = [System.Collections.ArrayList]::new()
+
+function Register-Page {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Subtitle,
+        [Parameter(Mandatory)][System.Windows.Forms.Control]$Panel
+    )
+
+    $Panel.Dock = 'Fill'
+    $Panel.Visible = $false
+    $Panel.Tag = $Subtitle
+    $script:Sync.Controls.ContentHost.Controls.Add($Panel)
+    $script:Pages[$Name] = $Panel
+
+    $navButton = New-Button -Text $Name -Width 186 -Height 38
+    $navButton.TextAlign = 'MiddleLeft'
+    $navButton.Padding = New-Object System.Windows.Forms.Padding(12, 0, 0, 0)
+    # No GetNewClosure() here: it would capture $this as it is now (null) and
+    # shadow the sender WinForms supplies when the click actually happens.
+    $navButton.Add_Click({ Show-Page -Name $this.Text })
+    $nav.Controls.Add($navButton)
+    $script:NavButtons[$Name] = $navButton
+}
+
+function Show-Page {
+    param([Parameter(Mandatory)][string]$Name)
+
+    foreach ($key in $script:Pages.Keys) {
+        $script:Pages[$key].Visible = ($key -eq $Name)
+    }
+
+    foreach ($key in $script:NavButtons.Keys) {
+        $button = $script:NavButtons[$key]
+        $button.Tag = if ($key -eq $Name) { 'AccentButton' } else { 'Button' }
+    }
+
+    $script:Sync.Controls.SubtitleLabel.Text = $script:Pages[$Name].Tag
+    Update-ThemeColors
+}
+
+#endregion
+
+#region Maintenance page
+
+$maintenancePage = New-Object System.Windows.Forms.TableLayoutPanel
+$maintenancePage.ColumnCount = 1
+$maintenancePage.RowCount = 2
+[void]$maintenancePage.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 250)))
+[void]$maintenancePage.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+$maintenanceCard = New-Card -Title 'Maintenance'
+$maintenancePage.Controls.Add($maintenanceCard, 0, 0)
+
+$maintenanceBody = New-Object System.Windows.Forms.TableLayoutPanel
+$maintenanceBody.Dock = 'Fill'
+$maintenanceBody.ColumnCount = 2
+$maintenanceBody.RowCount = 1
+[void]$maintenanceBody.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 55)))
+[void]$maintenanceBody.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 45)))
+$maintenanceCard.Controls.Add($maintenanceBody)
+$maintenanceBody.BringToFront()
+
+# Profile picker
+$profilePanel = New-Object System.Windows.Forms.FlowLayoutPanel
+$profilePanel.Dock = 'Fill'
+$profilePanel.FlowDirection = 'TopDown'
+$profilePanel.WrapContents = $false
+$profilePanel.AutoScroll = $true
+$maintenanceBody.Controls.Add($profilePanel, 0, 0)
+
+$profileHint = New-Object System.Windows.Forms.Label
+$profileHint.Text = 'Choose a profile, then preview it before running.'
+$profileHint.AutoSize = $true
+$profileHint.ForeColor = Get-ThemeColor Muted
+$profileHint.Margin = New-Object System.Windows.Forms.Padding(0, 4, 0, 8)
+$profilePanel.Controls.Add($profileHint)
+
+$script:ProfileRadios = @{}
+foreach ($item in Get-PCMaintenanceProfile) {
+    $radio = New-Object System.Windows.Forms.RadioButton
+    $radio.Text = "$($item.Name)  -  $($item.Description)"
+    $radio.AutoSize = $false
+    $radio.Width = 520
+    $radio.Height = 38
+    $radio.Font = $script:FontBody
+    $radio.ForeColor = Get-ThemeColor Text
+    $radio.Checked = ($item.Name -eq 'Quick')
+    $radio.Tag = $item.Name
+    $profilePanel.Controls.Add($radio)
+    $script:ProfileRadios[$item.Name] = $radio
+}
+
+$skipRestoreBox = New-CheckBox -Text 'Skip the restore point (not recommended)' -Name 'SkipRestore'
+$skipRestoreBox.Margin = New-Object System.Windows.Forms.Padding(0, 12, 0, 4)
+$profilePanel.Controls.Add($skipRestoreBox)
+
+# Action buttons
+$maintenanceActions = New-Object System.Windows.Forms.FlowLayoutPanel
+$maintenanceActions.Dock = 'Fill'
+$maintenanceActions.FlowDirection = 'TopDown'
+$maintenanceActions.WrapContents = $false
+$maintenanceBody.Controls.Add($maintenanceActions, 1, 0)
+
+function Get-SelectedProfileName {
+    foreach ($name in $script:ProfileRadios.Keys) {
+        if ($script:ProfileRadios[$name].Checked) { return $name }
+    }
+    'Quick'
+}
+
+function Start-Maintenance {
+    <#
+        Preview mode passes -WhatIf all the way down, so the plan the user sees
+        is produced by the same code path that would perform the work. That is
+        the point of building the module on ShouldProcess rather than writing a
+        separate "what would happen" description that can drift.
+    #>
+    param([switch]$Preview)
+
+    $profileName = Get-SelectedProfileName
+    $skipRestore = $skipRestoreBox.Checked
+    $grid = $script:Sync.Controls.MaintenanceGrid
+    $grid.Items.Clear()
+    Show-Summary -Result @()
+
+    $label = if ($Preview) { "Preview: $profileName" } else { "Maintenance: $profileName" }
+
+    Start-ShellTask -Name $label -Arguments @{
+        ProfileName = $profileName
+        SkipRestore = [bool]$skipRestore
+        Preview     = [bool]$Preview
+    } -Script {
+        param($ProfileName, $SkipRestore, $Preview)
+
+        $parameters = @{
+            ProfileName       = $ProfileName
+            SkipRestorePoint  = $SkipRestore
+            Confirm           = $false
+        }
+        if ($Preview) { $parameters['WhatIf'] = $true }
+
+        Invoke-PCMaintenance @parameters
+    } -OnSuccess {
+        param($results)
+
+        $items = @($results | Where-Object { $_ })
+        foreach ($result in $items) {
+            Add-ResultRow -Grid $script:Sync.Controls.MaintenanceGrid -Result $result
+        }
+        Show-Summary -Result $items
+
+        # Kept so Export-PCReport has the real objects, not the grid's strings.
+        $script:LastResults = $items
+
+        if ($items.Count -eq 0) {
+            Write-ShellLog -Level INFO -Message 'Preview produced no actions to perform.'
+        }
+    }
+}
+
+$previewButton = New-Button -Text 'Preview (no changes)' -Width 210 -OnClick { Start-Maintenance -Preview }
+$maintenanceActions.Controls.Add($previewButton)
+[void]$script:Sync.Controls.RunButtons.Add($previewButton)
+
+$runButton = New-Button -Text 'Run maintenance' -Width 210 -Accent -OnClick {
+    $profileName = Get-SelectedProfileName
+    $item = Get-PCMaintenanceProfile -Name $profileName
+
+    $message = "Run the '$profileName' profile?`r`n`r`n$($item.Description)"
+    if (-not $skipRestoreBox.Checked -and $item.RestorePoint) {
+        $message += "`r`n`r`nA system restore point will be created first."
+    }
+
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        $message, 'PC Tools', 'YesNo', 'Question')
+
+    if ($answer -eq 'Yes') { Start-Maintenance }
+}
+$maintenanceActions.Controls.Add($runButton)
+[void]$script:Sync.Controls.RunButtons.Add($runButton)
+
+$exportButton = New-Button -Text 'Export report' -Width 210 -OnClick {
+    $grid = $script:Sync.Controls.MaintenanceGrid
+    if ($grid.Items.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('Run something first.', 'PC Tools', 'OK', 'Information') | Out-Null
+        return
+    }
+    if ($script:LastResults) {
+        $paths = $script:LastResults | Export-PCReport
+        if ($paths) {
+            Write-ShellLog -Level INFO -Message "Report written to $($paths.TextPath)"
+            Start-Process -FilePath $paths.TextPath
+        }
+    }
+}
+$maintenanceActions.Controls.Add($exportButton)
+
+$openLogButton = New-Button -Text 'Open log file' -Width 210 -OnClick {
+    $path = Get-PCLogPath
+    if ($path -and (Test-Path -LiteralPath $path)) { Start-Process -FilePath $path }
+    else { Write-ShellLog -Level WARN -Message 'No log file is available.' }
+}
+$maintenanceActions.Controls.Add($openLogButton)
+
+# Results
+$resultsCard = New-Card -Title 'Results'
+$maintenancePage.Controls.Add($resultsCard, 0, 1)
+
+$maintenanceGrid = New-ResultGrid
+$resultsCard.Controls.Add($maintenanceGrid)
+$maintenanceGrid.BringToFront()
+$script:Sync.Controls.MaintenanceGrid = $maintenanceGrid
+
+Register-Page -Name 'Maintenance' -Subtitle 'Clean up, repair and verify Windows' -Panel $maintenancePage
+
+#endregion
+
+#region Network page
+
+$networkPage = New-Object System.Windows.Forms.TableLayoutPanel
+$networkPage.ColumnCount = 1
+$networkPage.RowCount = 3
+[void]$networkPage.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 92)))
+[void]$networkPage.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 210)))
+[void]$networkPage.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+# Verdict banner - the diagnosis, not a table of pass/fail rows
+$verdictCard = New-Card -Title '' -Padding 14
+$networkPage.Controls.Add($verdictCard, 0, 0)
+
+$verdictLabel = New-Object System.Windows.Forms.Label
+$verdictLabel.Text = 'Not tested yet'
+$verdictLabel.Font = $script:FontTitle
+$verdictLabel.Dock = 'Top'
+$verdictLabel.Height = 26
+$verdictLabel.ForeColor = Get-ThemeColor Muted
+$verdictCard.Controls.Add($verdictLabel)
+$script:Sync.Controls.VerdictLabel = $verdictLabel
+
+$adviceLabel = New-Object System.Windows.Forms.Label
+$adviceLabel.Text = 'Run a diagnostic to see where the problem is.'
+$adviceLabel.Dock = 'Fill'
+$adviceLabel.ForeColor = Get-ThemeColor Muted
+$verdictCard.Controls.Add($adviceLabel)
+$adviceLabel.BringToFront()
+$script:Sync.Controls.AdviceLabel = $adviceLabel
+
+# Adapters and actions
+$networkMiddle = New-Object System.Windows.Forms.TableLayoutPanel
+$networkMiddle.Dock = 'Fill'
+$networkMiddle.ColumnCount = 2
+[void]$networkMiddle.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 62)))
+[void]$networkMiddle.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 38)))
+$networkPage.Controls.Add($networkMiddle, 0, 1)
+
+$adapterCard = New-Card -Title 'Adapters'
+$networkMiddle.Controls.Add($adapterCard, 0, 0)
+
+$adapterGrid = New-Object System.Windows.Forms.ListView
+$adapterGrid.Dock = 'Fill'
+$adapterGrid.View = 'Details'
+$adapterGrid.FullRowSelect = $true
+$adapterGrid.HideSelection = $false
+$adapterGrid.BorderStyle = 'None'
+$adapterGrid.Font = $script:FontBody
+[void]$adapterGrid.Columns.Add('Adapter', 150)
+[void]$adapterGrid.Columns.Add('Status', 70)
+[void]$adapterGrid.Columns.Add('IPv4', 130)
+[void]$adapterGrid.Columns.Add('Gateway', 130)
+[void]$adapterGrid.Columns.Add('DNS', 180)
+[void]$adapterGrid.Columns.Add('DHCP', 60)
+$adapterCard.Controls.Add($adapterGrid)
+$adapterGrid.BringToFront()
+$script:Sync.Controls.AdapterGrid = $adapterGrid
+
+$networkActions = New-Object System.Windows.Forms.FlowLayoutPanel
+$networkActions.Dock = 'Fill'
+$networkActions.FlowDirection = 'TopDown'
+$networkActions.WrapContents = $false
+$networkActions.AutoScroll = $true
+$networkMiddle.Controls.Add($networkActions, 1, 0)
+
+function Update-AdapterGrid {
+    param([AllowEmptyCollection()][object[]]$Adapter)
+
+    $grid = $script:Sync.Controls.AdapterGrid
+    $grid.BeginUpdate()
+    try {
+        $grid.Items.Clear()
+        foreach ($item in $Adapter) {
+            $row = New-Object System.Windows.Forms.ListViewItem([string]$item.Name)
+            [void]$row.SubItems.Add([string]$item.Status)
+            [void]$row.SubItems.Add([string]$item.IPv4Address)
+            [void]$row.SubItems.Add([string]$item.Gateway)
+            [void]$row.SubItems.Add([string]$item.DnsServers)
+            [void]$row.SubItems.Add($(if ($item.Dhcp) { 'Yes' } elseif ($null -eq $item.Dhcp) { '?' } else { 'No' }))
+            $row.ForeColor = if ($item.Status -eq 'Up') { Get-ThemeColor Text } else { Get-ThemeColor Muted }
+            $row.Tag = $item.Name
+            [void]$grid.Items.Add($row)
+        }
+    }
+    finally {
+        $grid.EndUpdate()
+    }
+}
+
+function Show-Verdict {
+    param($Report)
+
+    $verdict = $Report.Verdict
+    $script:Sync.Controls.VerdictLabel.Text = $verdict.Verdict
+    $script:Sync.Controls.AdviceLabel.Text = $verdict.Advice
+    $script:Sync.Controls.VerdictLabel.ForeColor = if ($verdict.Healthy) {
+        Get-ThemeColor Success
+    }
+    else {
+        Get-ThemeColor Danger
+    }
+
+    $grid = $script:Sync.Controls.NetworkGrid
+    $grid.Items.Clear()
+    foreach ($test in $Report.Tests) {
+        $row = New-Object System.Windows.Forms.ListViewItem($(if ($test.Success) { 'Pass' } else { 'Fail' }))
+        [void]$row.SubItems.Add([string]$test.Layer)
+        [void]$row.SubItems.Add($(if ($null -ne $test.LatencyMs) { "$($test.LatencyMs) ms" } else { '' }))
+        [void]$row.SubItems.Add("$($test.Target) - $($test.Detail)")
+        $row.ForeColor = if ($test.Success) { Get-ThemeColor Success } else { Get-ThemeColor Danger }
+        [void]$grid.Items.Add($row)
+    }
+
+    $script:LastReport = $Report
+}
+
+function Start-NetworkDiagnostic {
+    param([switch]$Full)
+
+    Start-ShellTask -Name $(if ($Full) { 'Full network diagnostic' } else { 'Quick network diagnostic' }) `
+        -Arguments @{ Full = [bool]$Full } -Script {
+            param($Full)
+            Get-PCNetworkReport -Full:$Full
+        } -OnSuccess {
+            param($report)
+            if (-not $report) { return }
+            Update-AdapterGrid -Adapter @($report.Adapters)
+            Show-Verdict -Report $report
+        }
+}
+
+function Start-NetworkAction {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][scriptblock]$Script,
+        [hashtable]$Arguments = @{}
+    )
+
+    Start-ShellTask -Name $Label -Script $Script -Arguments $Arguments -OnSuccess {
+        param($results)
+        $items = @($results | Where-Object { $_ })
+        foreach ($result in $items) {
+            Add-ResultRow -Grid $script:Sync.Controls.NetworkGrid -Result $result
+        }
+        Show-Summary -Result $items
+        $script:LastResults = $items
+    }
+}
+
+$quickDiagButton = New-Button -Text 'Quick diagnostic' -Width 200 -Accent -OnClick { Start-NetworkDiagnostic }
+$networkActions.Controls.Add($quickDiagButton)
+[void]$script:Sync.Controls.RunButtons.Add($quickDiagButton)
+
+$fullDiagButton = New-Button -Text 'Full diagnostic' -Width 200 -OnClick { Start-NetworkDiagnostic -Full }
+$networkActions.Controls.Add($fullDiagButton)
+[void]$script:Sync.Controls.RunButtons.Add($fullDiagButton)
+
+$flushDnsButton = New-Button -Text 'Flush DNS cache' -Width 200 -OnClick {
+    Start-NetworkAction -Label 'Flush DNS cache' -Script { Clear-PCDnsCache -Confirm:$false }
+}
+$networkActions.Controls.Add($flushDnsButton)
+[void]$script:Sync.Controls.RunButtons.Add($flushDnsButton)
+
+$refreshAdaptersButton = New-Button -Text 'Refresh adapters' -Width 200 -OnClick {
+    Start-ShellTask -Name 'Refresh adapters' -Script { Get-PCNetworkAdapter } -OnSuccess {
+        param($adapters)
+        Update-AdapterGrid -Adapter @($adapters)
+    }
+}
+$networkActions.Controls.Add($refreshAdaptersButton)
+[void]$script:Sync.Controls.RunButtons.Add($refreshAdaptersButton)
+
+$dnsPresetLabel = New-Object System.Windows.Forms.Label
+$dnsPresetLabel.Text = 'Set DNS on the selected adapter:'
+$dnsPresetLabel.AutoSize = $true
+$dnsPresetLabel.ForeColor = Get-ThemeColor Muted
+$dnsPresetLabel.Margin = New-Object System.Windows.Forms.Padding(0, 10, 0, 4)
+$networkActions.Controls.Add($dnsPresetLabel)
+
+function Get-SelectedAdapterName {
+    $grid = $script:Sync.Controls.AdapterGrid
+    if ($grid.SelectedItems.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Select an adapter in the list first.', 'PC Tools', 'OK', 'Information') | Out-Null
+        return $null
+    }
+    [string]$grid.SelectedItems[0].Tag
+}
+
+foreach ($preset in @('Cloudflare', 'Google', 'Quad9')) {
+    $presetButton = New-Button -Text "DNS: $preset" -Width 200
+    $presetButton.Tag = $preset
+    $presetButton.Add_Click({
+        $adapterName = Get-SelectedAdapterName
+        if (-not $adapterName) { return }
+        $chosen = [string]$this.Tag
+
+        Start-NetworkAction -Label "Set DNS ($chosen)" -Arguments @{
+            AdapterName = $adapterName
+            Preset      = $chosen
+        } -Script {
+            param($AdapterName, $Preset)
+            Set-PCDnsServer -Name $AdapterName -Preset $Preset -Confirm:$false
+        }
+    })
+    $networkActions.Controls.Add($presetButton)
+    [void]$script:Sync.Controls.RunButtons.Add($presetButton)
+}
+
+$dhcpButton = New-Button -Text 'Revert to DHCP' -Width 200 -OnClick {
+    $adapterName = Get-SelectedAdapterName
+    if (-not $adapterName) { return }
+
+    Start-NetworkAction -Label 'Revert to DHCP' -Arguments @{ AdapterName = $adapterName } -Script {
+        param($AdapterName)
+        Set-PCDhcp -Name $AdapterName -Confirm:$false
+    }
+}
+$networkActions.Controls.Add($dhcpButton)
+[void]$script:Sync.Controls.RunButtons.Add($dhcpButton)
+
+$resetStackButton = New-Button -Text 'Reset network stack' -Width 200 -OnClick {
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        ("Reset the TCP/IP and Winsock stack?`r`n`r`n" +
+         "This requires a restart, and resetting Winsock removes third-party " +
+         "layered service providers - some VPN clients stop working until they " +
+         "are reinstalled.`r`n`r`nTry the other fixes first."),
+        'PC Tools', 'YesNo', 'Warning')
+
+    if ($answer -ne 'Yes') { return }
+
+    Start-NetworkAction -Label 'Reset network stack' -Script {
+        Reset-PCNetworkStack -Confirm:$false
+    }
+}
+$networkActions.Controls.Add($resetStackButton)
+[void]$script:Sync.Controls.RunButtons.Add($resetStackButton)
+
+$exportNetworkButton = New-Button -Text 'Export report' -Width 200 -OnClick {
+    if (-not $script:LastReport) {
+        [System.Windows.Forms.MessageBox]::Show('Run a diagnostic first.', 'PC Tools', 'OK', 'Information') | Out-Null
+        return
+    }
+    $paths = $script:LastReport | Export-PCReport -BaseName 'pctools-network'
+    if ($paths) {
+        Write-ShellLog -Level INFO -Message "Report written to $($paths.TextPath)"
+        Start-Process -FilePath $paths.TextPath
+    }
+}
+$networkActions.Controls.Add($exportNetworkButton)
+
+# Test results
+$networkResultsCard = New-Card -Title 'Test results'
+$networkPage.Controls.Add($networkResultsCard, 0, 2)
+
+$networkGrid = New-ResultGrid
+$networkGrid.Columns[0].Text = 'Result'
+$networkGrid.Columns[1].Text = 'Layer'
+$networkGrid.Columns[2].Text = 'Latency'
+$networkResultsCard.Controls.Add($networkGrid)
+$networkGrid.BringToFront()
+$script:Sync.Controls.NetworkGrid = $networkGrid
+
+Register-Page -Name 'Network' -Subtitle 'Diagnose and repair network problems' -Panel $networkPage
+
+#endregion
+
+#region Preferences page
+
+$preferencesPage = New-Object System.Windows.Forms.TableLayoutPanel
+$preferencesPage.ColumnCount = 1
+$preferencesPage.RowCount = 2
+[void]$preferencesPage.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$preferencesPage.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 190)))
+
+$preferencesCard = New-Card -Title 'Windows preferences'
+$preferencesPage.Controls.Add($preferencesCard, 0, 0)
+
+$preferencesBody = New-Object System.Windows.Forms.TableLayoutPanel
+$preferencesBody.Dock = 'Fill'
+$preferencesBody.ColumnCount = 2
+[void]$preferencesBody.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 70)))
+[void]$preferencesBody.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 30)))
+$preferencesCard.Controls.Add($preferencesBody)
+$preferencesBody.BringToFront()
+
+$preferencesList = New-Object System.Windows.Forms.FlowLayoutPanel
+$preferencesList.Dock = 'Fill'
+$preferencesList.FlowDirection = 'TopDown'
+$preferencesList.WrapContents = $false
+$preferencesList.AutoScroll = $true
+$preferencesList.Padding = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
+$preferencesBody.Controls.Add($preferencesList, 0, 0)
+
+$script:PreferenceBoxes = @{}
+
+function Update-PreferenceState {
+    <#
+        Reflects what Windows actually has set right now.
+
+        The original tool could not do this: it had no way to read a preference,
+        so every checkbox rendered unticked regardless of the machine's state,
+        and the user had no way to know what was already applied.
+    #>
+    param([AllowEmptyCollection()][object[]]$Preference)
+
+    foreach ($item in $Preference) {
+        $box = $script:PreferenceBoxes[$item.Name]
+        if (-not $box) { continue }
+
+        $box.Checked = $item.Enabled
+        $box.Text = if ($item.State -eq 'Partial') {
+            "$($item.Description)   (partially applied)"
+        }
+        else {
+            $item.Description
+        }
+        $box.ForeColor = if ($item.State -eq 'Partial') { Get-ThemeColor Warning } else { Get-ThemeColor Text }
+        $box.Tag = $item.Name
+    }
+}
+
+function Start-PreferenceRefresh {
+    Start-ShellTask -Name 'Read Windows preferences' -Script { Get-PCPreference } -OnSuccess {
+        param($preferences)
+        Update-PreferenceState -Preference @($preferences)
+    }
+}
+
+foreach ($definition in Get-PCPreference) {
+    $box = New-CheckBox -Text $definition.Description -Name $definition.Name -Checked $definition.Enabled
+    $box.Width = 560
+    $box.AutoSize = $false
+    $box.Height = 26
+    $preferencesList.Controls.Add($box)
+    $script:PreferenceBoxes[$definition.Name] = $box
+}
+
+$preferenceActions = New-Object System.Windows.Forms.FlowLayoutPanel
+$preferenceActions.Dock = 'Fill'
+$preferenceActions.FlowDirection = 'TopDown'
+$preferenceActions.WrapContents = $false
+$preferencesBody.Controls.Add($preferenceActions, 1, 0)
+
+$applyPreferencesButton = New-Button -Text 'Apply changes' -Width 190 -Accent -OnClick {
+    $enable = @()
+    $disable = @()
+
+    foreach ($name in $script:PreferenceBoxes.Keys) {
+        if ($script:PreferenceBoxes[$name].Checked) { $enable += $name } else { $disable += $name }
+    }
+
+    Start-ShellTask -Name 'Apply Windows preferences' -Arguments @{
+        Enable  = $enable
+        Disable = $disable
+    } -Script {
+        param($Enable, $Disable)
+
+        # Both directions run: a cleared box restores the Windows default,
+        # which the original tool had no way to express.
+        if ($Enable.Count) { Set-PCPreference -Name $Enable -Enabled $true -NoRestartExplorer -Confirm:$false }
+        if ($Disable.Count) { Set-PCPreference -Name $Disable -Enabled $false -NoRestartExplorer -Confirm:$false }
+    } -OnSuccess {
+        param($results)
+        $items = @($results | Where-Object { $_ })
+        foreach ($result in $items) {
+            Add-ResultRow -Grid $script:Sync.Controls.PreferenceGrid -Result $result
+        }
+        Show-Summary -Result $items
+        $script:LastResults = $items
+        Start-PreferenceRefresh
+    }
+}
+$preferenceActions.Controls.Add($applyPreferencesButton)
+[void]$script:Sync.Controls.RunButtons.Add($applyPreferencesButton)
+
+$refreshPreferencesButton = New-Button -Text 'Reload from Windows' -Width 190 -OnClick { Start-PreferenceRefresh }
+$preferenceActions.Controls.Add($refreshPreferencesButton)
+[void]$script:Sync.Controls.RunButtons.Add($refreshPreferencesButton)
+
+$restartExplorerButton = New-Button -Text 'Restart Explorer' -Width 190 -OnClick {
+    Start-ShellTask -Name 'Restart Explorer' -Script { Restart-PCExplorer -Confirm:$false } -OnSuccess {
+        param($result)
+        if ($result) { Add-ResultRow -Grid $script:Sync.Controls.PreferenceGrid -Result $result }
+    }
+}
+$preferenceActions.Controls.Add($restartExplorerButton)
+[void]$script:Sync.Controls.RunButtons.Add($restartExplorerButton)
+
+$preferenceHint = New-Object System.Windows.Forms.Label
+$preferenceHint.Text = "Clearing a box restores the Windows default. Explorer restarts only when you ask it to, so nothing disappears mid-click."
+$preferenceHint.AutoSize = $false
+$preferenceHint.Width = 190
+$preferenceHint.Height = 90
+$preferenceHint.ForeColor = Get-ThemeColor Muted
+$preferenceHint.Margin = New-Object System.Windows.Forms.Padding(0, 10, 0, 0)
+$preferenceActions.Controls.Add($preferenceHint)
+
+$preferenceResultsCard = New-Card -Title 'Results'
+$preferencesPage.Controls.Add($preferenceResultsCard, 0, 1)
+
+$preferenceGrid = New-ResultGrid
+$preferenceResultsCard.Controls.Add($preferenceGrid)
+$preferenceGrid.BringToFront()
+$script:Sync.Controls.PreferenceGrid = $preferenceGrid
+
+Register-Page -Name 'Preferences' -Subtitle 'Read and change Windows settings, both directions' -Panel $preferencesPage
+
+#endregion
+
+#region Log page
+
+$logPage = New-Object System.Windows.Forms.Panel
+$logCard = New-Card -Title 'Activity log'
+$logPage.Controls.Add($logCard)
+
+$logGrid = New-Object System.Windows.Forms.ListView
+$logGrid.Dock = 'Fill'
+$logGrid.View = 'Details'
+$logGrid.FullRowSelect = $true
+$logGrid.BorderStyle = 'None'
+$logGrid.Font = $script:FontMono
+[void]$logGrid.Columns.Add('Time', 90)
+[void]$logGrid.Columns.Add('Level', 70)
+[void]$logGrid.Columns.Add('Message', 900)
+$logCard.Controls.Add($logGrid)
+$logGrid.BringToFront()
+$script:Sync.Controls.LogGrid = $logGrid
+
+Register-Page -Name 'Log' -Subtitle 'Everything the tools have done this session' -Panel $logPage
+
+#endregion
+
+#region Theming
+
+function Update-ThemeColors {
+    <#
+        Walks the control tree and repaints from the active palette.
+
+        Controls carry their role in .Tag ('Card', 'Heading', 'AccentButton'),
+        so a new control gets themed by tagging it rather than by being added to
+        a hand-maintained list - which is what the original framework used, and
+        why its theme toggle silently missed any control added later.
+    #>
+    $theme = $script:Themes[$script:Sync.Theme]
+
+    $apply = {
+        param($Control)
+
+        switch -Regex ([string]$Control.Tag) {
+            '^Card$' {
+                $Control.BackColor = $theme.Card
+                break
+            }
+            '^AccentButton$' {
+                $Control.BackColor = $theme.Accent
+                $Control.ForeColor = $theme.AccentText
+                $Control.FlatAppearance.BorderColor = $theme.Accent
+                break
+            }
+            '^Button$' {
+                $Control.BackColor = $theme.Button
+                $Control.ForeColor = $theme.Text
+                $Control.FlatAppearance.BorderColor = $theme.Border
+                break
+            }
+            '^Heading$' {
+                $Control.ForeColor = $theme.Text
+                break
+            }
+        }
+
+        if ($Control -is [System.Windows.Forms.ListView]) {
+            $Control.BackColor = $theme.Card
+            $Control.ForeColor = $theme.Text
+        }
+        elseif ($Control -is [System.Windows.Forms.CheckBox] -or
+                $Control -is [System.Windows.Forms.RadioButton]) {
+            $Control.ForeColor = $theme.Text
+        }
+        elseif ($Control -is [System.Windows.Forms.TableLayoutPanel] -or
+                $Control -is [System.Windows.Forms.FlowLayoutPanel]) {
+            # Layout panels inside a card must not paint over it.
+            if ($Control.Parent -and [string]$Control.Parent.Tag -eq 'Card') {
+                $Control.BackColor = $theme.Card
+            }
+        }
+
+        foreach ($child in $Control.Controls) { & $apply $child }
+    }
+
+    $script:Sync.Form.BackColor = $theme.Back
+    foreach ($child in $script:Sync.Form.Controls) { & $apply $child }
+
+    $script:Sync.Controls.StatusLabel.ForeColor = $theme.Muted
+    $script:Sync.Controls.SubtitleLabel.ForeColor = $theme.Muted
+}
+
+$themeButton.Add_Click({
+    $script:Sync.Theme = if ($script:Sync.Theme -eq 'Dark') { 'Light' } else { 'Dark' }
+    Update-ThemeColors
+    Write-ShellLog -Level INFO -Message "Theme switched to $($script:Sync.Theme)."
+})
+
+#endregion
+
+#region Elevation
+
+function Update-ElevationState {
+    $isAdmin = Test-PCAdmin
+    $button = $script:Sync.Controls.ElevateButton
+    $button.Visible = -not $isAdmin
+
+    $suffix = if ($isAdmin) { 'Administrator' } else { 'Standard user - some actions are unavailable' }
+    $script:Sync.Form.Text = "$($script:App.Name) $($script:App.Version)  -  $suffix"
+}
+
+$elevateButton.Add_Click({
+    $arguments = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA',
+        '-File', "`"$PSCommandPath`"", '-Theme', $script:Sync.Theme
+    )
+
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Verb RunAs
+        $script:Sync.Form.Close()
+    }
+    catch {
+        # The user declining the UAC prompt is a normal outcome, not an error.
+        Write-ShellLog -Level WARN -Message 'Elevation was cancelled.'
+    }
+})
+
+#endregion
+
+#region Timers
+
+# Drains the log queue onto the UI thread. Batched, because appending one
+# ListView item per tick made the original framework's log pane crawl under a
+# chatty task.
+$logTimer = New-Object System.Windows.Forms.Timer
+$logTimer.Interval = 160
+$logTimer.Add_Tick({
+    $grid = $script:Sync.Controls.LogGrid
+    if (-not $grid -or $grid.IsDisposed) { return }
+
+    $batch = [System.Collections.Generic.List[object]]::new()
+    $entry = $null
+    while ($batch.Count -lt 100 -and $script:Sync.LogQueue.TryDequeue([ref]$entry)) {
+        if ($entry) { $batch.Add($entry) }
+    }
+    if ($batch.Count -eq 0) { return }
+
+    $grid.BeginUpdate()
+    try {
+        foreach ($item in $batch) {
+            $row = New-Object System.Windows.Forms.ListViewItem([string]$item.Timestamp)
+            [void]$row.SubItems.Add([string]$item.Level)
+            [void]$row.SubItems.Add([string]$item.Message)
+            $row.ForeColor = switch ([string]$item.Level) {
+                'ERROR' { Get-ThemeColor Danger }
+                'WARN'  { Get-ThemeColor Warning }
+                'DEBUG' { Get-ThemeColor Muted }
+                default { Get-ThemeColor Text }
+            }
+            [void]$grid.Items.Add($row)
+        }
+
+        # Keep the pane bounded; the file log is the complete record.
+        while ($grid.Items.Count -gt 2000) { $grid.Items.RemoveAt(0) }
+
+        $grid.EnsureVisible($grid.Items.Count - 1)
+    }
+    finally {
+        $grid.EndUpdate()
+    }
+})
+
+# Reaps finished runspace tasks.
+$taskTimer = New-Object System.Windows.Forms.Timer
+$taskTimer.Interval = 150
+$taskTimer.Add_Tick({
+    $finished = @($script:Sync.Tasks | Where-Object { $_.Handle -and $_.Handle.IsCompleted })
+    foreach ($task in $finished) {
+        $script:Sync.Tasks.Remove($task)
+        Complete-ShellTask -Task $task
+    }
+})
+
+#endregion
+
+#region Startup and shutdown
+
+$form.Add_Shown({
+    Update-ThemeColors
+    Update-ElevationState
+    Show-Page -Name 'Maintenance'
+
+    $logTimer.Start()
+    $taskTimer.Start()
+
+    Write-ShellLog -Level INFO -Message "$($script:App.Name) $($script:App.Version) started."
+    Write-ShellLog -Level INFO -Message "Log file: $(Get-PCLogPath)"
+
+    if (-not (Test-PCAdmin)) {
+        Write-ShellLog -Level WARN -Message 'Running without elevation. Repair and network actions will fail until you restart as administrator.'
+    }
+
+    # Populate the adapter list without blocking the window's first paint.
+    Start-ShellTask -Name 'Read adapters' -Script { Get-PCNetworkAdapter } -OnSuccess {
+        param($adapters)
+        Update-AdapterGrid -Adapter @($adapters)
+    }
+})
+
+$form.Add_FormClosing({
+    param($eventSender, $eventArgs)
+
+    if ($script:Sync.Busy) {
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "A task is still running.`r`n`r`nClosing now may leave it half-finished. Close anyway?",
+            'PC Tools', 'YesNo', 'Warning')
+
+        if ($answer -ne 'Yes') {
+            $eventArgs.Cancel = $true
+            return
+        }
+    }
+
+    try { $logTimer.Stop(); $logTimer.Dispose() } catch { }
+    try { $taskTimer.Stop(); $taskTimer.Dispose() } catch { }
+
+    foreach ($task in @($script:Sync.Tasks)) {
+        try { $task.Shell.Stop(); $task.Shell.Dispose() } catch { }
+    }
+
+    try { $script:Pool.Close(); $script:Pool.Dispose() } catch { }
+})
+
+[void]$form.ResumeLayout($true)
+[void]$form.ShowDialog()
+$form.Dispose()
+
+#endregion
