@@ -19,8 +19,6 @@ BeforeDiscovery {
 Describe 'PowerShell syntax' {
 
     It '<Name> parses without errors' -ForEach $script:SourceFiles {
-        param($Path, $Name)
-
         $parseErrors = $null
         $null = [System.Management.Automation.Language.Parser]::ParseFile(
             $Path, [ref]$null, [ref]$parseErrors)
@@ -36,8 +34,6 @@ Describe 'PowerShell syntax' {
     }
 
     It '<Name> has no BOM-less encoding surprises in string literals' -ForEach $script:SourceFiles {
-        param($Path, $Name)
-
         # Non-ASCII characters in a script that ships without a BOM are read as
         # mojibake by Windows PowerShell 5.1. Catch them before a user does.
         $content = Get-Content -Path $Path -Raw -Encoding UTF8
