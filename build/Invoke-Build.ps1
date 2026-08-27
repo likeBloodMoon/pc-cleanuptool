@@ -17,10 +17,18 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Test', 'Analyze', 'Release', 'All')]
+    [ValidateSet('Test', 'Analyze', 'Release', 'Checksum', 'All')]
     [string]$Task = 'All',
 
-    [string]$Version
+    [string]$Version,
+
+    # Warnings above this fail the build, so the count can only go down.
+    # 146 is what the repository carries today: mostly
+    # PSUseShouldProcessForStateChangingFunctions firing on the shell's
+    # internal UI helpers, where the rule does not apply but is worth keeping
+    # enabled for the module's actual cmdlets. Lower it as findings are fixed;
+    # raising it should be a deliberate, reviewed decision.
+    [int]$MaxWarning = 146
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,19 +83,41 @@ function Invoke-AnalyzeTask {
     $results = Invoke-ScriptAnalyzer -Path $RepoRoot -Recurse -Settings $settings |
         Where-Object { $_.ScriptPath -notmatch '[\\/](out|dist)[\\/]' }
 
-    if ($results) {
-        $results | Format-Table -AutoSize -Property Severity, ScriptName, Line, RuleName, Message | Out-String | Write-Host
-
-        $errors = @($results | Where-Object Severity -eq 'Error')
-        if ($errors.Count -gt 0) {
-            throw "PSScriptAnalyzer reported $($errors.Count) error(s)."
-        }
-
-        Write-Host "PSScriptAnalyzer reported $($results.Count) warning(s), no errors." -ForegroundColor Yellow
-    }
-    else {
+    if (-not $results) {
         Write-Host 'PSScriptAnalyzer: clean.' -ForegroundColor Green
+        return
     }
+
+    # Summarise by rule first. A flat list of a thousand findings is unreadable,
+    # and the useful question is always "which rule, and how often".
+    Write-Host ''
+    Write-Host 'Findings by rule:'
+    $results | Group-Object RuleName | Sort-Object Count -Descending | ForEach-Object {
+        Write-Host ('  {0,5}  {1}' -f $_.Count, $_.Name)
+    }
+
+    $errors = @($results | Where-Object Severity -eq 'Error')
+    $warnings = @($results | Where-Object Severity -eq 'Warning')
+
+    if ($errors.Count -gt 0) {
+        Write-Host ''
+        $errors | Format-Table -AutoSize -Property ScriptName, Line, RuleName, Message | Out-String | Write-Host
+        throw "PSScriptAnalyzer reported $($errors.Count) error(s)."
+    }
+
+    if ($warnings.Count -gt 0) {
+        Write-Host ''
+        $warnings | Format-Table -AutoSize -Property ScriptName, Line, RuleName, Message | Out-String | Write-Host
+    }
+
+    # A warning budget keeps the analyzer honest. Errors always fail; warnings
+    # fail once they exceed what the repository has agreed to carry, so the
+    # count can only go down.
+    if ($warnings.Count -gt $MaxWarning) {
+        throw "PSScriptAnalyzer reported $($warnings.Count) warning(s), over the budget of $MaxWarning. Fix them, or raise -MaxWarning deliberately."
+    }
+
+    Write-Host ("PSScriptAnalyzer: {0} warning(s), no errors (budget {1})." -f $warnings.Count, $MaxWarning) -ForegroundColor Yellow
 }
 
 function Invoke-ReleaseTask {
@@ -103,34 +133,72 @@ function Invoke-ReleaseTask {
     if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force }
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
-    # Standalone entry points people download or pipe into iex.
+    # The legacy single-file tools, which existing README links point at and
+    # which people still pipe into iex. Shipped loose so those URLs keep working.
     Get-ChildItem -Path $RepoRoot -Filter '*.ps1' -File |
         Copy-Item -Destination $outDir
 
-    # The module, zipped for manual install.
+    # The current toolkit. The GUI needs the module beside it, so this ships as
+    # a layout rather than as loose scripts.
+    $stage = Join-Path $RepoRoot 'obj/pc-tools'
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+    Copy-Item (Join-Path $RepoRoot 'pc-tools.ps1') -Destination $stage
+    Copy-Item (Join-Path $RepoRoot 'src') -Destination $stage -Recurse
+    foreach ($doc in 'README.md', 'CHANGELOG.md', 'LICENSE') {
+        $path = Join-Path $RepoRoot $doc
+        if (Test-Path $path) { Copy-Item $path -Destination $stage }
+    }
+
+    Compress-Archive -Path (Join-Path $stage '*') `
+        -DestinationPath (Join-Path $outDir "pc-tools-$Version.zip") -Force
+
+    # The module on its own, for people who only want the cmdlets.
     $moduleSrc = Join-Path $RepoRoot 'src/PCTools'
     if (Test-Path $moduleSrc) {
         Compress-Archive -Path $moduleSrc -DestinationPath (Join-Path $outDir "PCTools-$Version.zip") -Force
     }
 
+    Remove-Item $stage -Recurse -Force
+
+    Invoke-ChecksumTask
+
+    Write-Host "Artifacts staged in $outDir" -ForegroundColor Green
+}
+
+function Invoke-ChecksumTask {
+    <#
+        Kept separate from Release because Authenticode signing rewrites the
+        files it signs. Checksums generated before signing would not match what
+        the user downloads, which is worse than publishing none at all.
+    #>
     Write-Step 'Writing SHA256SUMS'
+
+    $outDir = Join-Path $RepoRoot 'out'
+    if (-not (Test-Path $outDir)) {
+        throw "No staged artifacts found in $outDir. Run -Task Release first."
+    }
+
+    $sumsPath = Join-Path $outDir 'SHA256SUMS'
+    if (Test-Path $sumsPath) { Remove-Item $sumsPath -Force }
+
     $sums = Get-ChildItem -Path $outDir -File | Sort-Object Name | ForEach-Object {
         '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
     }
-    $sumsPath = Join-Path $outDir 'SHA256SUMS'
     $sums | Set-Content -Path $sumsPath -Encoding UTF8
 
     Write-Host ''
     $sums | ForEach-Object { Write-Host "  $_" }
     Write-Host ''
-    Write-Host "Artifacts staged in $outDir" -ForegroundColor Green
 }
 
 switch ($Task) {
-    'Test'    { Invoke-TestTask }
-    'Analyze' { Invoke-AnalyzeTask }
-    'Release' { Invoke-ReleaseTask }
-    'All'     { Invoke-TestTask; Invoke-AnalyzeTask }
+    'Test'     { Invoke-TestTask }
+    'Analyze'  { Invoke-AnalyzeTask }
+    'Release'  { Invoke-ReleaseTask }
+    'Checksum' { Invoke-ChecksumTask }
+    'All'      { Invoke-TestTask; Invoke-AnalyzeTask }
 }
 
 Write-Host ''
