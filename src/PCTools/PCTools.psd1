@@ -66,12 +66,27 @@
     VariablesToExport = @()
     AliasesToExport   = @()
 
+    # Windows-only: the GUI needs WinForms, and the actions call Windows-only
+    # cmdlets. Declaring it keeps the module out of Linux and macOS search
+    # results on the Gallery rather than failing at import for those users.
+    CompatiblePSEditions = @('Desktop', 'Core')
+
     PrivateData = @{
         PSData = @{
-            Tags         = @('Windows', 'Maintenance', 'Cleanup', 'Network', 'Diagnostics', 'Optimization')
+            Tags         = @(
+                'Windows', 'Maintenance', 'Cleanup', 'Network', 'Diagnostics',
+                'Optimization', 'Repair', 'DISM', 'SFC', 'GUI',
+                'PSEdition_Desktop', 'PSEdition_Core'
+            )
             LicenseUri   = 'https://github.com/likeBloodMoon/pc-powershelltools/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/likeBloodMoon/pc-powershelltools'
-            ReleaseNotes = 'https://github.com/likeBloodMoon/pc-powershelltools/blob/main/CHANGELOG.md'
+            ReleaseNotes = @'
+Every action supports -WhatIf and returns a structured result.
+
+See the full changelog:
+https://github.com/likeBloodMoon/pc-powershelltools/blob/main/CHANGELOG.md
+'@
+            RequireLicenseAcceptance = $false
         }
     }
 }

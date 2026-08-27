@@ -44,6 +44,20 @@ Expand-Archive pc-tools.zip -DestinationPath .\pc-tools
 .\pc-tools\pc-tools.ps1
 ```
 
+### From the PowerShell Gallery
+
+Once a release is published there, this is the least ceremony:
+
+```powershell
+Install-Module PCTools -Scope CurrentUser
+Import-Module PCTools
+Invoke-PCMaintenance -ProfileName Quick -WhatIf
+```
+
+The Gallery gives you signed-package verification, versioning and
+`Update-Module` for free, which is everything the `irm | iex` route does not.
+It installs the module only; the GUI comes with the release archive.
+
 Or clone the repository and run `.\pc-tools.ps1`.
 
 ### A note on `irm | iex`
@@ -253,8 +267,13 @@ taskbar.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Phases 0-4 are done. Phase 5 (PowerShell Gallery,
-winget) is next.
+See [ROADMAP.md](ROADMAP.md). Phases 0-5 are done - the Gallery publish step is
+wired up and runs on a tagged release once an API key is configured.
+
+On the "portable executable" item: `ps2exe` output is unsigned and reliably
+trips SmartScreen and antivirus heuristics, which is worse for trust than the
+current script. The signed module plus the checksummed archive is the better
+answer unless a code-signing certificate is in the budget.
 
 Suggestions and contributions are welcome.
 

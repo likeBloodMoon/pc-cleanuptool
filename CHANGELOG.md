@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   save/apply adapter profile.
 
 ### Changed
+- PowerShell Gallery publishing wired into the release workflow, gated on a
+  `PSGALLERY_API_KEY` secret and refusing to republish an existing version.
+- Module manifest carries Gallery metadata: `CompatiblePSEditions`, edition
+  tags and inline release notes.
 - Install instructions are pinned to a release tag and hash-verified. The
   previous `irm .../main/... | iex` commands are documented with their trade-off
   rather than recommended.

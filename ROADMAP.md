@@ -174,7 +174,7 @@ Each becomes small once Phases 1–2 land:
 - **More diagnostics** — traceroute with per-hop latency, MTU/path-MTU probe,
   Wi-Fi signal sampling over time, throughput test.
 
-## Phase 5 — Distribution
+## Phase 5 — Distribution ✅ done
 
 - **PowerShell Gallery**: `Install-Module PCTools` — the credible alternative to
   `irm | iex`, and it gets you versioning and updates for free.
@@ -210,7 +210,7 @@ Phases 0-3 are implemented. What actually shipped, against what was planned:
 | 2 Application shell | Done | The async callback bug turned out to be latent rather than live; see the corrected description above. |
 | 3 Safety and trust | Done | `-WhatIf` preflight, restore-point gating, result summary, pinned + checksummed releases, signing wired to a certificate secret. |
 | 4 Features | Done | Network profiles, JSON config, traceroute, MTU probe, Wi-Fi status. Nine preference toggles, up from six, all reversible. |
-| 5 Distribution | Next | PowerShell Gallery, winget. |
+| 5 Distribution | Done | Gallery publish wired into the release workflow, gated on an API key. winget deferred until releases are actually signed. |
 | 6 `quickspeedboost.ps1` | Partly | Its worthwhile parts are in the module; the script itself is still present and now documented honestly in the README. |
 
 ## Suggested order
