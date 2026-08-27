@@ -84,6 +84,15 @@ function Get-PCMaintenanceProfile {
         }
     )
 
+    # Profiles loaded from a user's JSON config are first-class: they appear in
+    # the list and run through the same orchestrator. A user profile with the
+    # same name as a built-in wins, so a config file can override a preset.
+    $imported = @($script:PCImportedProfile)
+    if ($imported.Count -gt 0) {
+        $overridden = $imported.Name
+        $profiles = @($profiles | Where-Object { $overridden -notcontains $_.Name }) + $imported
+    }
+
     if ($Name) {
         $match = @($profiles | Where-Object Name -eq $Name)
         if ($match.Count -eq 0) {

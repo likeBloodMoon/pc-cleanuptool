@@ -157,7 +157,7 @@ This is what decides whether anyone but you runs these tools.
   recommended", with per-action detail — the Cleanup Tool currently tells the user
   nothing quantitative.
 
-## Phase 4 — The features already on the README roadmap
+## Phase 4 — The features already on the README roadmap ✅ done
 
 Each becomes small once Phases 1–2 land:
 
@@ -209,7 +209,7 @@ Phases 0-3 are implemented. What actually shipped, against what was planned:
 | 1 `PCTools` module | Done | 29 public functions. Several behavioural bugs fixed in passing — see the CHANGELOG. |
 | 2 Application shell | Done | The async callback bug turned out to be latent rather than live; see the corrected description above. |
 | 3 Safety and trust | Done | `-WhatIf` preflight, restore-point gating, result summary, pinned + checksummed releases, signing wired to a certificate secret. |
-| 4 Features | Next | Network profiles, more preference toggles, more diagnostics. |
+| 4 Features | Done | Network profiles, JSON config, traceroute, MTU probe, Wi-Fi status. Nine preference toggles, up from six, all reversible. |
 | 5 Distribution | Next | PowerShell Gallery, winget. |
 | 6 `quickspeedboost.ps1` | Partly | Its worthwhile parts are in the module; the script itself is still present and now documented honestly in the README. |
 

@@ -34,6 +34,9 @@ $script:PCLogPath = $null
 $script:PCLogSinkTable = @{}
 $script:PCLogSinks = @()
 
+# Maintenance profiles loaded from a user's JSON config, if any.
+$script:PCImportedProfile = @()
+
 try {
     if (-not (Test-Path -LiteralPath $script:PCLogDirectory)) {
         New-Item -ItemType Directory -Path $script:PCLogDirectory -Force | Out-Null

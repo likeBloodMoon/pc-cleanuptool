@@ -46,6 +46,10 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# Microsoft.VisualBasic supplies InputBox, which WinForms itself has no
+# equivalent for and which beats hand-rolling a modal prompt form.
+Add-Type -AssemblyName Microsoft.VisualBasic
+
 # Per-monitor DPI awareness. Without it the fixed-pixel layouts in the original
 # tools render blurry and clip their text at 150% scaling, which is the default
 # on most laptops sold in the last five years.
@@ -1150,6 +1154,111 @@ $resetStackButton = New-Button -Text 'Reset network stack' -Width 200 -OnClick {
 }
 $networkActions.Controls.Add($resetStackButton)
 [void]$script:Sync.Controls.RunButtons.Add($resetStackButton)
+
+$traceButton = New-Button -Text 'Trace route' -Width 200 -OnClick {
+    $script:Sync.Controls.NetworkGrid.Items.Clear()
+
+    Start-ShellTask -Name 'Trace route' -Script {
+        Test-PCRoute -Target '1.1.1.1' -MaxHops 20 -TimeoutSeconds 2
+    } -OnSuccess {
+        param($hops)
+        $grid = $script:Sync.Controls.NetworkGrid
+        foreach ($hop in @($hops)) {
+            $row = New-Object System.Windows.Forms.ListViewItem("Hop $($hop.Hop)")
+            [void]$row.SubItems.Add('Route')
+            [void]$row.SubItems.Add($(if ($null -ne $hop.LatencyMs) { "$($hop.LatencyMs) ms" } else { '' }))
+            [void]$row.SubItems.Add("$($hop.Address) - $($hop.Status)")
+            $row.ForeColor = if ($hop.Status -eq 'TimedOut') { Get-ThemeColor Muted } else { Get-ThemeColor Text }
+            [void]$grid.Items.Add($row)
+        }
+    }
+}
+$networkActions.Controls.Add($traceButton)
+[void]$script:Sync.Controls.RunButtons.Add($traceButton)
+
+$mtuButton = New-Button -Text 'Check path MTU' -Width 200 -OnClick {
+    Start-ShellTask -Name 'Check path MTU' -Script {
+        Test-PCMtu -Target '1.1.1.1' -TimeoutSeconds 3
+    } -OnSuccess {
+        param($probe)
+        if (-not $probe) { return }
+        $grid = $script:Sync.Controls.NetworkGrid
+        $row = New-Object System.Windows.Forms.ListViewItem($(if ($probe.Standard) { 'Pass' } else { 'Check' }))
+        [void]$row.SubItems.Add('MTU')
+        [void]$row.SubItems.Add($(if ($probe.Mtu) { "$($probe.Mtu)" } else { '' }))
+        [void]$row.SubItems.Add($probe.Detail)
+        $row.ForeColor = if ($probe.Standard) { Get-ThemeColor Success } else { Get-ThemeColor Warning }
+        [void]$grid.Items.Add($row)
+    }
+}
+$networkActions.Controls.Add($mtuButton)
+[void]$script:Sync.Controls.RunButtons.Add($mtuButton)
+
+$wirelessButton = New-Button -Text 'Wi-Fi signal' -Width 200 -OnClick {
+    Start-ShellTask -Name 'Wi-Fi signal' -Script { Get-PCWirelessStatus } -OnSuccess {
+        param($status)
+        if (-not $status) { return }
+        $grid = $script:Sync.Controls.NetworkGrid
+        $row = New-Object System.Windows.Forms.ListViewItem($(if ($status.Connected) { 'Info' } else { 'Fail' }))
+        [void]$row.SubItems.Add('Wi-Fi')
+        [void]$row.SubItems.Add($(if ($status.Connected) { "$($status.SignalPercent)%" } else { '' }))
+        [void]$row.SubItems.Add($(if ($status.Connected) { "$($status.Ssid) - $($status.Detail)" } else { $status.Detail }))
+        $row.ForeColor = if (-not $status.Connected) { Get-ThemeColor Muted }
+                         elseif ($status.SignalGrade -eq 'Poor') { Get-ThemeColor Danger }
+                         elseif ($status.SignalGrade -eq 'Fair') { Get-ThemeColor Warning }
+                         else { Get-ThemeColor Success }
+        [void]$grid.Items.Add($row)
+    }
+}
+$networkActions.Controls.Add($wirelessButton)
+[void]$script:Sync.Controls.RunButtons.Add($wirelessButton)
+
+$saveProfileButton = New-Button -Text 'Save adapter profile' -Width 200 -OnClick {
+    $adapterName = Get-SelectedAdapterName
+    if (-not $adapterName) { return }
+
+    $profileName = [Microsoft.VisualBasic.Interaction]::InputBox(
+        'Name for this configuration (for example: Office, Home)', 'Save network profile', $adapterName)
+    if (-not $profileName) { return }
+
+    Start-NetworkAction -Label "Save profile '$profileName'" -Arguments @{
+        AdapterName = $adapterName
+        ProfileName = $profileName
+    } -Script {
+        param($AdapterName, $ProfileName)
+        Export-PCNetworkProfile -Name $AdapterName -ProfileName $ProfileName -Confirm:$false
+    }
+}
+$networkActions.Controls.Add($saveProfileButton)
+[void]$script:Sync.Controls.RunButtons.Add($saveProfileButton)
+
+$applyProfileButton = New-Button -Text 'Apply adapter profile' -Width 200 -OnClick {
+    $saved = @(Get-PCNetworkProfile)
+    if ($saved.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'No network profiles have been saved yet. Select an adapter and use "Save adapter profile" first.',
+            'PC Tools', 'OK', 'Information') | Out-Null
+        return
+    }
+
+    $choice = [Microsoft.VisualBasic.Interaction]::InputBox(
+        "Which profile?`r`n`r`nSaved: $(($saved.ProfileName) -join ', ')",
+        'Apply network profile', $saved[0].ProfileName)
+    if (-not $choice) { return }
+
+    $adapterName = Get-SelectedAdapterName
+    if (-not $adapterName) { return }
+
+    Start-NetworkAction -Label "Apply profile '$choice'" -Arguments @{
+        ProfileName = $choice
+        AdapterName = $adapterName
+    } -Script {
+        param($ProfileName, $AdapterName)
+        Import-PCNetworkProfile -ProfileName $ProfileName -Name $AdapterName -Confirm:$false
+    }
+}
+$networkActions.Controls.Add($applyProfileButton)
+[void]$script:Sync.Controls.RunButtons.Add($applyProfileButton)
 
 $exportNetworkButton = New-Button -Text 'Export report' -Width 200 -OnClick {
     if (-not $script:LastReport) {

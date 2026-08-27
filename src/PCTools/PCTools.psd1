@@ -1,6 +1,6 @@
 @{
     RootModule        = 'PCTools.psm1'
-    ModuleVersion     = '0.3.0'
+    ModuleVersion     = '0.4.0'
     GUID              = '6f3c0a58-1d2e-4a7b-9c34-8e5f2b7d41a9'
     Author            = 'likeBloodMoon'
     CompanyName       = 'likeBloodMoon'
@@ -26,13 +26,19 @@
 
         # Network
         'Clear-PCDnsCache'
+        'Export-PCNetworkProfile'
         'Get-PCNetworkAdapter'
+        'Get-PCNetworkProfile'
         'Get-PCNetworkReport'
+        'Get-PCWirelessStatus'
+        'Import-PCNetworkProfile'
         'Reset-PCNetworkStack'
         'Set-PCDhcp'
         'Set-PCDnsServer'
         'Set-PCNetworkAddress'
         'Test-PCConnectivity'
+        'Test-PCMtu'
+        'Test-PCRoute'
 
         # Preferences
         'Get-PCPreference'
@@ -45,6 +51,7 @@
         # Orchestration and reporting
         'Export-PCReport'
         'Get-PCMaintenanceProfile'
+        'Import-PCConfiguration'
         'Invoke-PCMaintenance'
 
         # Host integration

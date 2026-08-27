@@ -30,6 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them when a signing certificate is configured.
 - `Format-PCByteSize` is public, so hosts can format a total without reaching
   into module internals.
+- Network profiles: `Export-PCNetworkProfile`, `Import-PCNetworkProfile` and
+  `Get-PCNetworkProfile` save and restore an adapter's full configuration
+  (DHCP or static address, prefix, gateway, DNS) as JSON, giving the Home/Work
+  presets the roadmap asked for.
+- `Import-PCConfiguration`: user-defined maintenance profiles from a JSON file.
+  Imported profiles appear in `Get-PCMaintenanceProfile` and run through
+  `Invoke-PCMaintenance` unchanged; one with the same name as a built-in
+  overrides it. Every action name is validated at import, so a typo fails there
+  rather than partway through a run.
+- `Test-PCRoute`: per-hop traceroute, answering where connectivity stops rather
+  than only that it has.
+- `Test-PCMtu`: path MTU probe, the diagnostic for the case where DNS resolves
+  and small requests work but large transfers and TLS handshakes stall.
+- `Get-PCWirelessStatus`: parses and grades the Wi-Fi association instead of
+  dumping `netsh wlan show interfaces` as raw text.
+- The shell's Network page gained Trace route, Check path MTU, Wi-Fi signal, and
+  save/apply adapter profile.
 
 ### Changed
 - Install instructions are pinned to a release tag and hash-verified. The

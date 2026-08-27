@@ -29,7 +29,7 @@ Download the release archive, **verify it**, and run it from disk:
 
 ```powershell
 # 1. Download the current release and its checksums
-$version = 'v0.3.0'
+$version = 'v0.4.0'
 $base    = "https://github.com/likeBloodMoon/pc-powershelltools/releases/download/$version"
 Invoke-WebRequest "$base/pc-tools-$($version.TrimStart('v')).zip" -OutFile pc-tools.zip
 Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
@@ -58,8 +58,8 @@ If you use them, pin to a release tag rather than `main`:
 
 ```powershell
 # Legacy single-file tools, pinned to a tag
-irm https://raw.githubusercontent.com/likeBloodMoon/pc-powershelltools/v0.3.0/pc-cleanuptool.ps1 | iex
-irm https://raw.githubusercontent.com/likeBloodMoon/pc-powershelltools/v0.3.0/pc-netdiag.ps1 | iex
+irm https://raw.githubusercontent.com/likeBloodMoon/pc-powershelltools/v0.4.0/pc-cleanuptool.ps1 | iex
+irm https://raw.githubusercontent.com/likeBloodMoon/pc-powershelltools/v0.4.0/pc-netdiag.ps1 | iex
 ```
 
 The verified download above is the recommended path.
@@ -120,6 +120,40 @@ $report.Verdict.Advice
 $report | Export-PCReport
 ```
 
+Save and restore adapter configurations:
+
+```powershell
+Export-PCNetworkProfile -Name Ethernet -ProfileName Office
+Get-PCNetworkProfile | Format-Table ProfileName, Adapter, Dhcp, IPv4Address
+Import-PCNetworkProfile -ProfileName Office -WhatIf
+```
+
+Define your own maintenance profiles in JSON:
+
+```json
+{
+  "profiles": [
+    {
+      "name": "Weekly",
+      "description": "What I actually run on Fridays",
+      "restorePoint": false,
+      "actions": [
+        { "action": "Clear-PCTempFile" },
+        { "action": "Clear-PCBrowserCache", "parameters": { "Browser": ["Chrome"] } }
+      ]
+    }
+  ]
+}
+```
+
+```powershell
+Import-PCConfiguration -Path .\my-profiles.json
+Invoke-PCMaintenance -ProfileName Weekly -WhatIf
+```
+
+Action names are validated at import, so a typo fails there rather than partway
+through a run. A profile named the same as a built-in overrides it.
+
 Individual actions:
 
 ```powershell
@@ -129,6 +163,10 @@ Set-PCDnsServer -Name Ethernet -Preset Cloudflare
 Set-PCPreference -Name DarkMode, ShowFileExtensions -Enabled $true
 Set-PCPreference -Name DisableMouseAcceleration -Enabled $false   # revert
 Repair-PCSystemImage -ScanOnly
+
+Test-PCRoute -Target 1.1.1.1          # where does connectivity stop
+Test-PCMtu                            # large transfers stalling?
+Get-PCWirelessStatus                  # signal, band and rate
 ```
 
 ### Maintenance profiles
@@ -215,9 +253,8 @@ taskbar.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Phases 0-3 are done; Phase 4 (network profiles,
-more preferences, more diagnostics) and Phase 5 (PowerShell Gallery, winget) are
-next.
+See [ROADMAP.md](ROADMAP.md). Phases 0-4 are done. Phase 5 (PowerShell Gallery,
+winget) is next.
 
 Suggestions and contributions are welcome.
 
