@@ -51,7 +51,7 @@ A plan for turning four standalone scripts into one maintained toolkit.
 
 ---
 
-## Phase 0 — Foundation (small, do first)
+## Phase 0 — Foundation ✅ done
 
 Nothing here changes behaviour; everything after it gets easier.
 
@@ -67,7 +67,7 @@ Nothing here changes behaviour; everything after it gets easier.
 - Correct the README's async claim; add `quickspeedboost.ps1` to the docs or
   remove it (see Phase 6).
 
-## Phase 1 — Extract a `PCTools` module
+## Phase 1 — Extract a `PCTools` module ✅ done
 
 Move the logic out of the GUIs. This is the change everything else depends on.
 
@@ -102,7 +102,7 @@ Fix while extracting: `Clear-TempFiles` pipes `Get-ChildItem -Recurse` into
 `Remove-Item -Recurse` — the double recursion is slow and noisy. Enumerate one
 level, delete recursively, and measure bytes freed on the way through.
 
-## Phase 2 — Promote `gui-framework.ps1` to the application shell
+## Phase 2 — Promote `gui-framework.ps1` to the application shell ✅ done
 
 The framework is already the answer to the "UI freezes" problem; it just is not
 wired to anything.
@@ -118,18 +118,28 @@ wired to anything.
 Two things in the framework to fix during the port:
 
 - `Complete-AsyncTask` calls `Invoke-UI { & $Task.OnSuccess $result }`. The
-  scriptblock is queued with `BeginInvoke` and runs later, resolving `$Task` and
-  `$result` from the enclosing scope at *execution* time. When two tasks complete
-  in the same 120 ms timer tick, both queued callbacks are likely to see the last
-  task's values. Pass them as explicit `BeginInvoke` arguments and add a
-  regression test that completes two async tasks simultaneously.
+  scriptblock resolves `$Task` and `$result` at *execution* time, and when it is
+  queued with `BeginInvoke` it executes after `Complete-AsyncTask` has returned
+  and that scope is gone — so the callback fails outright ("the expression after
+  '&' produced an object that was not valid") rather than receiving stale
+  values. It is currently latent: the task pump is a WinForms `Timer`, already
+  on the UI thread, so `InvokeRequired` is false and the block runs
+  synchronously while the scope still exists. Anything that completes a task off
+  the UI thread breaks it. Bind the values into the block with
+  `GetNewClosure()`, which does not depend on how WinForms marshals a delegate's
+  parameter array.
 - `$sync.Controls.Tasks` is a plain `ArrayList` mutated from the timer; make it
   `[System.Collections.ArrayList]::Synchronized(...)` to match the rest of `$sync`.
+
+A third, found during the port: the framework sets `Set-StrictMode -Version
+Latest`, under which reading a not-yet-assigned hashtable key is a *terminating
+error*. A guard such as `if ($sync.Controls.StatusLabel)` therefore throws
+instead of returning false. Declare every control key up front.
 
 Also add DPI awareness at startup — at 150 % scaling the fixed-pixel layouts blur
 and clip today.
 
-## Phase 3 — Safety and trust
+## Phase 3 — Safety and trust ✅ done
 
 This is what decides whether anyone but you runs these tools.
 
@@ -188,6 +198,20 @@ keep it behind an `-Advanced` switch with an honest note that it usually costs
 performance rather than adding it.
 
 ---
+
+## Status
+
+Phases 0-3 are implemented. What actually shipped, against what was planned:
+
+| Phase | State | Notes |
+|---|---|---|
+| 0 Foundation | Done | Also caught a live encoding bug: both GUIs stored non-ASCII characters with no BOM, so Windows PowerShell 5.1 decoded them as ANSI. |
+| 1 `PCTools` module | Done | 29 public functions. Several behavioural bugs fixed in passing — see the CHANGELOG. |
+| 2 Application shell | Done | The async callback bug turned out to be latent rather than live; see the corrected description above. |
+| 3 Safety and trust | Done | `-WhatIf` preflight, restore-point gating, result summary, pinned + checksummed releases, signing wired to a certificate secret. |
+| 4 Features | Next | Network profiles, more preference toggles, more diagnostics. |
+| 5 Distribution | Next | PowerShell Gallery, winget. |
+| 6 `quickspeedboost.ps1` | Partly | Its worthwhile parts are in the module; the script itself is still present and now documented honestly in the README. |
 
 ## Suggested order
 
