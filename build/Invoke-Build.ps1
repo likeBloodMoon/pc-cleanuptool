@@ -20,7 +20,11 @@ param(
     [ValidateSet('Test', 'Analyze', 'Release', 'Checksum', 'All')]
     [string]$Task = 'All',
 
-    [string]$Version
+    [string]$Version,
+
+    # Warnings above this fail the build. Lower it as findings are fixed;
+    # raising it should be a deliberate, reviewed decision.
+    [int]$MaxWarning = 500
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,19 +79,41 @@ function Invoke-AnalyzeTask {
     $results = Invoke-ScriptAnalyzer -Path $RepoRoot -Recurse -Settings $settings |
         Where-Object { $_.ScriptPath -notmatch '[\\/](out|dist)[\\/]' }
 
-    if ($results) {
-        $results | Format-Table -AutoSize -Property Severity, ScriptName, Line, RuleName, Message | Out-String | Write-Host
-
-        $errors = @($results | Where-Object Severity -eq 'Error')
-        if ($errors.Count -gt 0) {
-            throw "PSScriptAnalyzer reported $($errors.Count) error(s)."
-        }
-
-        Write-Host "PSScriptAnalyzer reported $($results.Count) warning(s), no errors." -ForegroundColor Yellow
-    }
-    else {
+    if (-not $results) {
         Write-Host 'PSScriptAnalyzer: clean.' -ForegroundColor Green
+        return
     }
+
+    # Summarise by rule first. A flat list of a thousand findings is unreadable,
+    # and the useful question is always "which rule, and how often".
+    Write-Host ''
+    Write-Host 'Findings by rule:'
+    $results | Group-Object RuleName | Sort-Object Count -Descending | ForEach-Object {
+        Write-Host ('  {0,5}  {1}' -f $_.Count, $_.Name)
+    }
+
+    $errors = @($results | Where-Object Severity -eq 'Error')
+    $warnings = @($results | Where-Object Severity -eq 'Warning')
+
+    if ($errors.Count -gt 0) {
+        Write-Host ''
+        $errors | Format-Table -AutoSize -Property ScriptName, Line, RuleName, Message | Out-String | Write-Host
+        throw "PSScriptAnalyzer reported $($errors.Count) error(s)."
+    }
+
+    if ($warnings.Count -gt 0) {
+        Write-Host ''
+        $warnings | Format-Table -AutoSize -Property ScriptName, Line, RuleName, Message | Out-String | Write-Host
+    }
+
+    # A warning budget keeps the analyzer honest. Errors always fail; warnings
+    # fail once they exceed what the repository has agreed to carry, so the
+    # count can only go down.
+    if ($warnings.Count -gt $MaxWarning) {
+        throw "PSScriptAnalyzer reported $($warnings.Count) warning(s), over the budget of $MaxWarning. Fix them, or raise -MaxWarning deliberately."
+    }
+
+    Write-Host ("PSScriptAnalyzer: {0} warning(s), no errors (budget {1})." -f $warnings.Count, $MaxWarning) -ForegroundColor Yellow
 }
 
 function Invoke-ReleaseTask {
