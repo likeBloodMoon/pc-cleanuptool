@@ -22,9 +22,13 @@ param(
 
     [string]$Version,
 
-    # Warnings above this fail the build. Lower it as findings are fixed;
+    # Warnings above this fail the build, so the count can only go down.
+    # 146 is what the repository carries today: mostly
+    # PSUseShouldProcessForStateChangingFunctions firing on the shell's
+    # internal UI helpers, where the rule does not apply but is worth keeping
+    # enabled for the module's actual cmdlets. Lower it as findings are fixed;
     # raising it should be a deliberate, reviewed decision.
-    [int]$MaxWarning = 500
+    [int]$MaxWarning = 146
 )
 
 $ErrorActionPreference = 'Stop'

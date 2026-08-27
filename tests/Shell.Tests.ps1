@@ -123,7 +123,7 @@ Describe 'Shell structure' {
 
     It 'guards against closing while a task is still running' {
         $script:ShellText | Should -Match 'Add_FormClosing'
-        $script:ShellText | Should -Match '\$eventArgs\.Cancel = \$true'
+        $script:ShellText | Should -Match '\$closingArgs\.Cancel = \$true'
     }
 }
 

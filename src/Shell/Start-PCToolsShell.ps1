@@ -1638,7 +1638,10 @@ $form.Add_Shown({
 })
 
 $form.Add_FormClosing({
-    param($eventSender, $eventArgs)
+    # These parameters are deliberately not named after the WinForms
+    # convention: PowerShell reserves those names as automatic variables, and
+    # shadowing an automatic variable in a param block invites a confusing bug.
+    param($closingSender, $closingArgs)
 
     if ($script:Sync.Busy) {
         $answer = [System.Windows.Forms.MessageBox]::Show(
@@ -1646,7 +1649,7 @@ $form.Add_FormClosing({
             'PC Tools', 'YesNo', 'Warning')
 
         if ($answer -ne 'Yes') {
-            $eventArgs.Cancel = $true
+            $closingArgs.Cancel = $true
             return
         }
     }
